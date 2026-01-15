@@ -1,0 +1,475 @@
+﻿using HarmonyLib;
+using RimWorld;
+using System;
+using System.Collections.Generic;
+using System.Linq;
+using System.Reflection;
+using System.Timers;
+using UnityEngine;
+using Verse;
+using static HarmonyLib.AccessTools;
+
+namespace Puppeteer
+{
+	public enum PuppeteerEvent
+	{
+		GameEntered,
+		GameExited,
+		Save,
+		ColonistsChanged,
+		AreasChanged,
+		PrioritiesChanged,
+		SendChangedPriorities,
+		SchedulesChanged,
+		SendChangedSchedules,
+		UpdateColonists,
+		UpdateSocials,
+		TimeChanged,
+		MapEntered,
+	}
+
+	public interface ICommandProcessor
+	{
+		void Message(byte[] msg);
+	}
+
+	[StaticConstructorOnStartup]
+	public class Controller : ICommandProcessor
+	{
+		public static Controller instance = new Controller();
+
+		readonly Timer coinRefreshTimer = new Timer(coinRefreshIntervalInSeconds * 1000) { AutoReset = true };
+		public Timer connectionRetryTimer = new Timer(10000) { AutoReset = true };
+
+		const int coinRefreshIntervalInSeconds = 10;
+
+		public Connection connection;
+		bool firstTime = true;
+		bool prioritiesChanged = false;
+		bool schedulesChanged = false;
+
+		public Controller()
+		{
+			_ = FileWatcher.AddListener((action, file) =>
+			{
+				if (file == Connection.tokenFilename)
+				{
+					Tools.LogWarning("Token file changed");
+					var timer = new Timer(1000);
+					timer.Elapsed += (_sender, _evnt) => connection?.TryConnect();
+					timer.AutoReset = false;
+					timer.Start();
+				}
+			});
+
+			coinRefreshTimer.Elapsed += new ElapsedEventHandler((sender, e) =>
+			{
+				if (Find.CurrentMap != null)
+					GeneralCommands.SendCoinsToAll(connection);
+			});
+			coinRefreshTimer.Start();
+
+			connectionRetryTimer.Elapsed += new ElapsedEventHandler((sender, e) =>
+			{
+				connection?.Send(new Ping());
+			});
+			connectionRetryTimer.Start();
+		}
+
+		~Controller()
+		{
+			connectionRetryTimer?.Stop();
+			coinRefreshTimer?.Stop();
+		}
+
+		public void SetEvent(PuppeteerEvent evt)
+		{
+			try
+			{
+				// Log.Warning($"SET EVENT {evt}");
+				switch (evt)
+				{
+					case PuppeteerEvent.GameEntered:
+						connection = new Connection(this);
+						break;
+					case PuppeteerEvent.GameExited:
+						connection?.Disconnect();
+						connection = null;
+						break;
+					case PuppeteerEvent.Save:
+						State.Save();
+						break;
+					case PuppeteerEvent.ColonistsChanged:
+						if (firstTime == false)
+							GeneralCommands.SendAllColonists(connection);
+						firstTime = false;
+						break;
+					case PuppeteerEvent.AreasChanged:
+						GeneralCommands.SendAreas(connection);
+						break;
+					case PuppeteerEvent.PrioritiesChanged:
+						prioritiesChanged = true;
+						break;
+					case PuppeteerEvent.SendChangedPriorities:
+						if (prioritiesChanged)
+						{
+							prioritiesChanged = false;
+							GeneralCommands.SendPriorities(connection);
+						}
+						break;
+					case PuppeteerEvent.SchedulesChanged:
+						schedulesChanged = true;
+						break;
+					case PuppeteerEvent.SendChangedSchedules:
+						if (schedulesChanged)
+						{
+							schedulesChanged = false;
+							GeneralCommands.SendSchedules(connection);
+						}
+						break;
+					case PuppeteerEvent.UpdateColonists:
+						Tools.UpdateColonists();
+						break;
+					case PuppeteerEvent.UpdateSocials:
+						GeneralCommands.SendNextSocial(connection);
+						break;
+					case PuppeteerEvent.TimeChanged:
+						GeneralCommands.SendTimeInfoToAll();
+						break;
+					case PuppeteerEvent.MapEntered:
+						State.Instance.ResetLastControlled();
+						break;
+				}
+			}
+			catch (Exception e)
+			{
+				Tools.LogWarning($"While setting event {evt}: {e}");
+			}
+		}
+
+		public void Message(byte[] msg)
+		{
+			if (connection == null) return;
+			try
+			{
+				var cmd = SimpleCmd.Create(msg);
+				// Tools.LogWarning($"--> {cmd.type}");
+				switch (cmd.type)
+				{
+					case "welcome":
+						{
+							var info = Welcome.Create(msg);
+							GeneralCommands.CheckVersionRequired(info);
+							GeneralCommands.SendAllColonists(connection);
+							break;
+						}
+					case "join":
+						GeneralCommands.Join(connection, Join.Create(msg).viewer);
+						break;
+					case "leave":
+						GeneralCommands.Leave(Leave.Create(msg).viewer);
+						break;
+					case "assign":
+						{
+							var assign = Assign.Create(msg);
+							var pawn = Tools.ColonistForThingID(assign.colonistID);
+							AssignViewerToPawn(assign.viewer, pawn);
+							break;
+						}
+					case "state":
+						{
+							var state = IncomingState.Create(msg);
+							if (state?.key != null && state?.val != null)
+								OperationQueue.Add(OperationType.SetState, () => StateCommand.Set(connection, state));
+							else
+								Tools.LogWarning($"Bad state command from {state?.user}, key='{state?.key}' val='{state?.val}'");
+							break;
+						}
+					case "job":
+						{
+							var job = IncomingJob.Create(msg);
+							var puppeteer = State.Instance.PuppeteerForViewer(job.user);
+							Jobs.Run(connection, puppeteer, job);
+							break;
+						}
+					case "stalling":
+						{
+							var stalling = StallingState.Create(msg);
+							var puppeteer = State.Instance.PuppeteerForViewer(stalling.viewer);
+							if (puppeteer != null && puppeteer.connected)
+							{
+								puppeteer.stalling = stalling.state;
+								var state = puppeteer.stalling ? "started" : "ends";
+								Tools.LogWarning($"{stalling.viewer.name} {state} stalling");
+							}
+							break;
+						}
+					case "chat":
+						{
+							var chat = IncomingChat.Create(msg);
+							if (TwitchToolkitMod.Exists)
+							{
+								TwitchToolkitMod.SendMessage(chat.viewer.id, chat.viewer.name, chat.message);
+							}
+							var puppeteer = State.Instance.PuppeteerForViewer(chat.viewer);
+							GeneralCommands.SendCoins(connection, puppeteer);
+							break;
+						}
+					case "customize":
+						{
+							var info = Customize.Create(msg);
+							var puppeteer = State.Instance.PuppeteerForViewer(info.viewer);
+							var pawn = puppeteer?.puppet?.pawn;
+							if (pawn != null)
+								Customizer.Change(pawn, info.key, info.val);
+							break;
+						}
+					default:
+						{
+							Tools.LogWarning($"unknown command '{cmd.type}'");
+							break;
+						}
+				}
+			}
+			catch (Exception e)
+			{
+				Tools.LogWarning($"While handling {msg}: {e}");
+			}
+		}
+
+		public void SendChatMessage(ViewerID vID, string message)
+		{
+			GeneralCommands.SendChatMessage(connection, vID, message);
+		}
+
+		public void PawnAvailable(Pawn pawn)
+		{
+			State.Instance.UpdatePawn(pawn);
+			GeneralCommands.Availability(connection, pawn);
+			State.Save();
+			GeneralCommands.SendAllColonists(connection);
+		}
+
+		public void PawnUnavailable(Pawn pawn)
+		{
+			GeneralCommands.Assign(connection, pawn, null);
+			GeneralCommands.Availability(connection, pawn);
+			if (State.Instance.RemovePawn(pawn))
+				State.Save();
+			GeneralCommands.SendAllColonists(connection);
+		}
+
+		public void AssignViewerToPawn(ViewerID vID, Pawn pawn)
+		{
+			GeneralCommands.Assign(connection, pawn, vID);
+			GeneralCommands.SendAllColonists(connection);
+		}
+
+		public void UpdateAvailability(Pawn pawn)
+		{
+			GeneralCommands.Availability(connection, pawn);
+		}
+
+		public void UpdatePortrait(Pawn pawn)
+		{
+			var puppet = State.Instance.PuppetForPawn(pawn);
+			GeneralCommands.SendPortrait(connection, puppet?.puppeteer);
+		}
+
+		public void UpdateGear(Pawn pawn)
+		{
+			var vID = State.Instance.PuppetForPawn(pawn)?.puppeteer?.vID;
+			if (vID != null)
+				OperationQueue.Add(OperationType.Inventory, new Operation() { name = pawn.ThingID, action = () => GeneralCommands.SendGear(connection, vID) });
+		}
+
+		public void UpdateInventory(Pawn pawn)
+		{
+			var vID = State.Instance.PuppetForPawn(pawn)?.puppeteer?.vID;
+			if (vID != null)
+				OperationQueue.Add(OperationType.Inventory, new Operation() { name = pawn.ThingID, action = () => GeneralCommands.SendInventory(connection, vID) });
+		}
+
+		ColonistBaseInfo.NeedInfo[] GetNeeds(Pawn pawn)
+		{
+			var needs = pawn.needs.AllNeeds.Where(n => n.ShowOnNeedList && n.GetType() != typeof(Need_Mood)).ToList();
+			if (needs == null) return Array.Empty<ColonistBaseInfo.NeedInfo>();
+			PawnNeedsUIUtility.SortInDisplayOrder(needs);
+			needs.InsertRange(0, pawn.needs.AllNeeds.Where(n => n.GetType() == typeof(Need_Mood)));
+			return needs
+				.Select(need => new ColonistBaseInfo.NeedInfo(need))
+				.ToArray();
+		}
+
+		ColonistBaseInfo.ThoughtInfo[] GetThoughts(Pawn pawn)
+		{
+			var overallThoughtGroups = new List<Thought>();
+			PawnNeedsUIUtility.GetThoughtGroupsInDisplayOrder(pawn.needs.mood, overallThoughtGroups);
+			return overallThoughtGroups.Select(overallThoughtGroup =>
+			{
+				var thoughtGroup = new List<Thought>();
+				pawn.needs.mood.thoughts.GetMoodThoughts(overallThoughtGroup, thoughtGroup);
+				var leadingThoughtInGroup = PawnNeedsUIUtility.GetLeadingThoughtInGroup(thoughtGroup);
+				if (!leadingThoughtInGroup.VisibleInNeedsTab)
+					return null;
+				var name = leadingThoughtInGroup.LabelCap;
+				if (thoughtGroup.Count > 1) name = $"{name} {thoughtGroup.Count}x";
+				var value = (int)pawn.needs.mood.thoughts.MoodOffsetOfGroup(leadingThoughtInGroup);
+				var duration = overallThoughtGroup.def.DurationTicks;
+				var memories = thoughtGroup.OfType<Thought_Memory>().Where(th => th.age > 0);
+				var min = memories.Any() ? (int)Math.Round(memories.Min(thought =>
+				{
+					(duration - thought.age).TicksToPeriod(out var y1, out var q1, out var d1, out var val);
+					return val;
+				})) : 0;
+				var max = memories.Any() ? (int)Math.Round(memories.Max(thought =>
+				{
+					(duration - thought.age).TicksToPeriod(out var y1, out var q1, out var d1, out var val);
+					return val;
+				})) : 0;
+				return new ColonistBaseInfo.ThoughtInfo() { name = name, value = value, min = min, max = max };
+			})
+			.ToArray();
+		}
+
+		ColonistBaseInfo.CapacityInfo[] GetCapacities(Pawn pawn)
+		{
+			var result = DefDatabase<PawnCapacityDef>.AllDefs
+				.Where(def => def.showOnHumanlikes && PawnCapacityUtility.BodyCanEverDoCapacity(pawn.RaceProps.body, def))
+				.OrderBy(def => def.listOrder)
+				.Select(def =>
+				{
+					// RimWorld 1.5: GetLabelFor signature changed
+					var name = def.GetLabelFor(pawn).CapitalizeFirst();
+					var value = HealthCardUtility.GetEfficiencyLabel(pawn, def);
+					return new ColonistBaseInfo.CapacityInfo() { name = name, value = value.First, rgb = Tools.GetRGB(value.Second) };
+				})
+				.ToList();
+			var pain = HealthCardUtility.GetPainLabel(pawn);
+			result.Insert(0, new ColonistBaseInfo.CapacityInfo()
+			{
+				name = "PainLevel".Translate(),
+				value = pain.First,
+				rgb = Tools.GetRGB(pain.Second)
+			});
+			return result.ToArray();
+		}
+
+		ColonistBaseInfo.Injury[] GetInjuries(Pawn pawn)
+		{
+			// RimWorld 1.5: VisibleHediffGroupsInOrder is removed, use alternative approach
+			var hediffs = pawn.health.hediffSet.hediffs
+				.Where(h => h.Visible)
+				.GroupBy(h => h.Part)
+				.Select(group =>
+				{
+					var hediffInfos = new List<ColonistBaseInfo.HediffInfo>();
+					var part = group.Key;
+					var name = part?.LabelCap ?? "WholeBody".Translate();
+					group.GroupBy(d => d.UIGroupKey).DoIf(grouping => grouping != null, grouping =>
+					{
+						ColonistBaseInfo.HediffInfo lastHediffInfo = null;
+						grouping.DoIf(hediff2 => hediff2 != null, hediff2 =>
+						{
+							if (hediff2.LabelCap != lastHediffInfo?.name)
+							{
+								lastHediffInfo = new ColonistBaseInfo.HediffInfo()
+								{
+									name = hediff2.LabelCap,
+									count = 1,
+									rgb = Tools.GetRGB(hediff2.LabelColor)
+								};
+								hediffInfos.Add(lastHediffInfo);
+							}
+							else
+							{
+								if (lastHediffInfo != null)
+									lastHediffInfo.count++;
+							}
+						});
+					});
+					var color = part == null ? HealthUtility.RedColor : HealthUtility.GetPartConditionLabel(pawn, part).Second;
+					return new ColonistBaseInfo.Injury() { name = name, hediffs = hediffInfos.ToArray(), rgb = Tools.GetRGB(color) };
+				})
+				.ToArray();
+			return hediffs;
+		}
+
+		public static ColonistBaseInfo.SkillInfo[] GetSkills(Pawn pawn)
+		{
+			var skills = pawn.skills;
+			// RimWorld 1.5: skillDefsInListOrderCached is removed, use DefDatabase directly
+			return DefDatabase<SkillDef>.AllDefsListForReading
+				.OrderBy(def => def.listOrder)
+				.Select(skillDef => skills.GetSkill(skillDef))
+				.Where(skill => skill.TotallyDisabled == false)
+				.Select(skill => new ColonistBaseInfo.SkillInfo()
+				{
+					name = skill.def.skillLabel.CapitalizeFirst(),
+					level = skill.Level,
+					passion = (int)skill.passion,
+					progress = new[] { (int)skill.xpSinceLastLevel, (int)skill.XpRequiredForLevelUp }
+				})
+				.ToArray();
+		}
+
+		static readonly MethodInfo m_GetWorkTypeDisabledCausedBy = Method(typeof(CharacterCardUtility), "GetWorkTypeDisabledCausedBy");
+		static readonly FastInvokeHandler GetWorkTypeDisabledCausedBy = MethodInvoker.GetHandler(m_GetWorkTypeDisabledCausedBy);
+
+		static readonly MethodInfo m_GetWorkTypesDisabledByWorkTag = Method(typeof(CharacterCardUtility), "GetWorkTypesDisabledByWorkTag");
+		static readonly FastInvokeHandler GetWorkTypesDisabledByWorkTag = MethodInvoker.GetHandler(m_GetWorkTypesDisabledByWorkTag);
+
+		public void UpdateColonist(State.Puppeteer puppeteer)
+		{
+			var pawn = puppeteer?.puppet?.pawn;
+			if (pawn == null || pawn.Spawned == false) return;
+
+			string IncapableInfo(WorkTags t)
+			{
+				return GetWorkTypeDisabledCausedBy(null, new object[] { pawn, t }) + "\n" + GetWorkTypesDisabledByWorkTag(null, new object[] { t });
+			}
+
+			var carrier = Tools.GetCarrier(pawn);
+			var childhood = pawn.story.GetBackstory(BackstorySlot.Childhood);
+			var adulthood = pawn.story.GetBackstory(BackstorySlot.Adulthood);
+			var disabledTags = pawn.CombinedDisabledWorkTags.GetAllSelectedItems<WorkTags>().Where(t => t != WorkTags.None).ToList();
+			var info = new ColonistBaseInfo.Info
+			{
+				name = pawn.Name.ToStringFull,
+				x = (carrier ?? pawn).Position.x,
+				y = (carrier ?? pawn).Position.z,
+				mx = (carrier ?? pawn).Map?.Size.x ?? 0,
+				my = (carrier ?? pawn).Map?.Size.z ?? 0,
+				childhood = new Tag(childhood?.TitleCapFor(pawn.gender) ?? "", childhood?.FullDescriptionFor(pawn) ?? ""),
+				adulthood = new Tag(adulthood?.TitleCapFor(pawn.gender) ?? "", adulthood?.FullDescriptionFor(pawn) ?? ""),
+				inspect = carrier != null ? Array.Empty<string>() : pawn.GetInspectString().Split(new[] { "\r\n", "\r", "\n" }, StringSplitOptions.None),
+				health = new ColonistBaseInfo.Percentage()
+				{
+					label = HealthUtility.GetGeneralConditionLabel(pawn, true),
+					percent = pawn.health.summaryHealth.SummaryHealthPercent
+				},
+				mood = new ColonistBaseInfo.Percentage()
+				{
+					label = pawn.needs.mood.MoodString.CapitalizeFirst(),
+					percent = pawn.needs.mood.CurLevelPercentage
+				},
+				restrict = new ColonistBaseInfo.Value(pawn.timetable.CurrentAssignment.LabelCap, pawn.timetable.CurrentAssignment.color),
+				// RimWorld 1.5: EffectiveAreaRestriction renamed to EffectiveAreaRestrictionInPawnCurrentMap
+				area = new ColonistBaseInfo.Value(AreaUtility.AreaAllowedLabel(pawn), pawn.playerSettings?.EffectiveAreaRestrictionInPawnCurrentMap?.Color ?? Color.gray),
+				drafted = pawn.Drafted,
+				response = pawn.playerSettings?.hostilityResponse.GetLabel() ?? "",
+				needs = GetNeeds(pawn),
+				thoughts = GetThoughts(pawn),
+				capacities = GetCapacities(pawn),
+				bleedingRate = (int)(pawn.health.hediffSet.BleedRateTotal * 100f + 0.5f)
+			};
+			var ticksUntilDeath = HealthUtility.TicksUntilDeathDueToBloodLoss(pawn);
+			info.deathIn = (int)(((float)ticksUntilDeath / GenDate.TicksPerHour) + 0.5f);
+			info.injuries = GetInjuries(pawn);
+			info.skills = GetSkills(pawn);
+			info.incapable = disabledTags.Select(tag => new Tag(tag.LabelTranslated().CapitalizeFirst(), IncapableInfo(tag))).ToArray();
+			info.traits = pawn.story.traits.allTraits.Select(trait => new Tag(trait.LabelCap, trait.TipString(pawn))).ToArray();
+			connection.Send(new ColonistBaseInfo() { viewer = puppeteer.vID, info = info });
+		}
+	}
+}

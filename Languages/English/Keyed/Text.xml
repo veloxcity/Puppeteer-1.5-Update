@@ -1,0 +1,15 @@
+﻿<?xml version="1.0" encoding="utf-8" ?>
+<LanguageData>
+
+	<NewPuppeteerVersion>New Puppeteer Version</NewPuppeteerVersion>
+
+	<MapImageSize>Map Image Size</MapImageSize>
+	<MapImageCompression>Map Image Compression</MapImageCompression>
+	<MapUpdateFrequency>Map Image Update Frequency</MapUpdateFrequency>
+
+	<StartTickets>Number of respawn tickets</StartTickets>
+	<PlayerActionCooldownTicks>Control cooldown preventing respawn (game hours)</PlayerActionCooldownTicks>
+
+	<SendChatResponsesToTwitch>Send Toolkit chat responses to Twitch</SendChatResponsesToTwitch>
+
+</LanguageData>
